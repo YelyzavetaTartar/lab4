@@ -1,0 +1,225 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <fstream>
+#include <thread>
+#include <shared_mutex>
+#include <mutex>
+#include <random>
+#include <chrono>
+#include <iomanip>
+#include <map>
+
+class ThreadSafeData {
+private:
+    std::vector<int> data;
+
+mutable std::vector<std::shared_mutex> mutexes;
+
+public:
+    ThreadSafeData(int m = 2) : data(m, 0), mutexes(m) {}
+
+    int read(int index) const {
+        if (index < 0 || index >= data.size()) return -1;
+        std::shared_lock<std::shared_mutex> lock(mutexes[index]);
+        return data[index];
+    }
+
+    void write(int index, int value) {
+        if (index < 0 || index >= data.size()) return;
+        std::unique_lock<std::shared_mutex> lock(mutexes[index]);
+        data[index] = value;
+    }
+
+    operator std::string() const {
+        std::shared_lock<std::shared_mutex> lock0(mutexes[0]);
+        std::shared_lock<std::shared_mutex> lock1(mutexes[1]);
+
+        std::ostringstream oss;
+        oss << "Fields: [" << data[0] << ", " << data[1] << "]";
+        return oss.str();
+    }
+};
+
+enum class OpType { READ, WRITE, STRING };
+
+struct Command {
+    OpType type;
+    int field_index;
+    int value;
+};
+
+void generate_file(const std::string& filename, int count,
+    int p_r0, int p_w0, int p_r1, int p_w1, int p_str) {
+
+    std::ofstream file(filename);
+    std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> dist(0, 99);
+
+    for (int i = 0; i < count; ++i) {
+        int r = dist(rng);
+        int current = 0;
+
+        if (r < (current += p_r0)) {
+            file << "read 0\n";
+        }
+        else if (r < (current += p_w0)) {
+            file << "write 0 1\n"; 
+        }
+        else if (r < (current += p_r1)) {
+            file << "read 1\n";
+        }
+        else if (r < (current += p_w1)) {
+            file << "write 1 1\n";
+        }
+        else {
+            file << "string\n";
+        }
+    }
+    file.close();
+}
+
+std::vector<Command> load_commands(const std::string& filename) {
+    std::vector<Command> commands;
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error opening file: " << filename << std::endl;
+        return commands;
+    }
+
+    std::string line, cmd_str;
+    int idx, val;
+
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        ss >> cmd_str;
+
+        Command cmd;
+        if (cmd_str == "write") {
+            ss >> idx >> val;
+            cmd = { OpType::WRITE, idx, val };
+        }
+        else if (cmd_str == "read") {
+            ss >> idx;
+            cmd = { OpType::READ, idx, 0 };
+        }
+        else {
+            // string
+            cmd = { OpType::STRING, -1, 0 };
+        }
+        commands.push_back(cmd);
+    }
+    return commands;
+}
+
+void worker(ThreadSafeData& ds, const std::vector<Command>& commands) {
+    volatile int dummy_read = 0;
+
+    for (const auto& cmd : commands) {
+        switch (cmd.type) {
+        case OpType::READ:
+            dummy_read = ds.read(cmd.field_index);
+            break;
+        case OpType::WRITE:
+            ds.write(cmd.field_index, cmd.value);
+            break;
+        case OpType::STRING: {
+            std::string s = ds;
+            if (s.empty()) dummy_read++;
+            break;
+        }
+        }
+    }
+}
+
+int main() {
+    const int OPS_COUNT = 200000;
+    const int MAX_THREADS = 3;
+
+    struct Scenario {
+        std::string name;
+        std::string file_prefix; // Префікс для назв файлів
+        int p_r0, p_w0, p_r1, p_w1, p_str;
+    };
+
+    std::vector<Scenario> scenarios = {
+       
+        {"(a) Variant 15", "data_var", 10, 5, 50, 10, 25},
+
+        {"(b) Equal Dist", "data_eq",  20, 20, 20, 20, 20},
+
+        {"(c) Write Heavy", "data_diff", 5, 40, 5, 40, 10}
+    };
+
+    std::cout << "Generating separate test files for each thread..." << std::endl;
+
+    for (const auto& sc : scenarios) {
+        for (int i = 0; i < MAX_THREADS; ++i) {
+            std::string filename = sc.file_prefix + "_" + std::to_string(i) + ".txt";
+            generate_file(filename, OPS_COUNT, sc.p_r0, sc.p_w0, sc.p_r1, sc.p_w1, sc.p_str);
+        }
+    }
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "\n--- Starting Benchmark ---\n";
+    std::cout << "Operations per thread: " << OPS_COUNT << "\n";
+
+    std::map<std::string, std::vector<double>> results;
+
+    for (const auto& sc : scenarios) {
+        std::cout << "\nScenario: " << sc.name << std::endl;
+        results[sc.name] = {};
+
+        std::vector<std::vector<Command>> thread_commands;
+        for (int i = 0; i < MAX_THREADS; ++i) {
+            std::string filename = sc.file_prefix + "_" + std::to_string(i) + ".txt";
+            thread_commands.push_back(load_commands(filename));
+        }
+
+        for (int threads_num = 1; threads_num <= MAX_THREADS; ++threads_num) {
+            ThreadSafeData ds;
+            std::vector<std::thread> threads;
+
+            auto start = std::chrono::high_resolution_clock::now();
+
+            for (int i = 0; i < threads_num; ++i) {
+                // ВАЖЛИВО: Кожен потік отримує свій власний набір команд (thread_commands[i])
+                // Це відповідає вимозі "для кожного потоку має бути свій файл"
+                threads.emplace_back(worker, std::ref(ds), std::ref(thread_commands[i]));
+            }
+
+            for (auto& t : threads) {
+                t.join();
+            }
+
+            auto end = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double, std::milli> duration = end - start;
+
+            std::cout << "  Threads: " << threads_num << " | Time: " << duration.count() << " ms" << std::endl;
+            results[sc.name].push_back(duration.count());
+        }
+    }
+
+    std::cout << "\n=== Results Table (Time in ms) ===\n";
+    std::cout << "Scenario       | 1 Thread | 2 Threads | 3 Threads\n";
+    std::cout << "-------------------------------------------------\n";
+    for (const auto& sc : scenarios) {
+        std::cout << std::left << std::setw(14) << sc.name << " | ";
+        for (double t : results[sc.name]) {
+            std::cout << std::setw(8) << t << " | ";
+        }
+        std::cout << "\n";
+    }
+
+    std::cout << "\n--- Final Structure Check ---\n";
+    ThreadSafeData final_ds;
+    final_ds.write(0, 777);
+    final_ds.write(1, 888);
+    std::string s = final_ds;
+    std::cout << "Expected [777, 888]. Actual: " << s << std::endl;
+
+    return 0;
+}
+    
